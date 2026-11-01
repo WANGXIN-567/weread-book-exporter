@@ -4,8 +4,11 @@
 核心特性：
 1. 自动切换至双栏水平翻页模式，解决网页端上下滚动模式下因虚拟滚动分片导致章节下半部分漏字的问题。
 2. 捕获 Canvas 2D 绘制指令与分栏坐标，精准切分每一单页，消除跨页文字重复或交错。
-3. 自动抓取书籍元数据（书名、作者、简介）并下载原版高清封面（cover.jpg）。
-4. 智能适配系统内置 Edge / Chrome，免去下载 200MB 浏览器的漫长等待。
+3. 基于官方目录（_catalog.json）精确反推章节分界，支持标题粘连自动剥离，杜绝单章塌陷。
+4. 基于 Cookie (wr_vid/wr_skey) 精准鉴权，支持 300 秒扫码等待。
+5. 逐页实时落盘（断点保护），每页输出详细抓取进度。
+6. 自动抓取书籍元数据（书名、作者、简介）并下载原版高清封面（cover.jpg）。
+7. 智能适配系统内置 Edge / Chrome，免去下载 200MB 浏览器的漫长等待。
 """
 import asyncio
 import collections
@@ -20,9 +23,9 @@ import urllib.request
 from playwright.async_api import async_playwright
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-USER_DATA_DIR = os.path.join(BASE, "cache", "browser_profile")
+USER_DATA_DIR = os.environ.get("WEREAD_PROFILE", os.path.join(BASE, "cache", "browser_profile"))
 
-# 翻页节奏：宁可慢，也不要给服务器造成压力
+# 翻页节奏配置：温和防风控
 PAGE_DELAY_RANGE = (8.0, 20.0)       # 每次翻页后的随机等待（秒）
 LONG_PAUSE_EVERY = (10, 20)          # 每隔 10~20 页触发一次长停顿
 LONG_PAUSE_RANGE = (60.0, 120.0)     # 长停顿时长（秒）
@@ -40,11 +43,9 @@ def extract_book_id(raw_input):
     m = re.search(r"(?:reader|bookDetail)/([a-zA-Z0-9_-]+)", text)
     if m:
         return m.group(1)
-    # 如果是纯 ID（数字、英文字符组合，长度大于 6）
     m_id = re.search(r"^[a-zA-Z0-9_-]{6,36}$", text)
     if m_id:
         return m_id.group(0)
-    # 兜底：剥离 URL 前缀与查询参数
     clean = re.sub(r"^https?://[^/]+/", "", text).split("?")[0].strip("/")
     return clean or text
 
@@ -104,7 +105,7 @@ SENT_END_RE = re.compile(r"[。！？；：…][”」）】》]*$")
 
 
 def norm(s):
-    return re.sub(r"\s+", "", (s or "").replace("\u200b", ""))
+    return re.sub(r"[\s\u200b\ufeff\u3000\-_:：,，、.·]+", "", s or "")
 
 
 def size_of(f):
@@ -116,7 +117,7 @@ def cls_of(f):
     s = size_of(f)
     if s >= 24.5:
         return "title"
-    if s >= 22.0:
+    if s >= 21.0:
         return "yw"
     if "bold" in (f or ""):
         return "fang"
@@ -127,7 +128,7 @@ def split_pages(chars):
     """按 (seq, side) 以及 y 坐标回跳切分为独立单页"""
     real = []
     for c in chars:
-        t = c["t"].replace("\u200b", "")
+        t = c["t"].replace("\u200b", "").replace("\ufeff", "")
         if not t.strip():
             continue
         if t.startswith("abcdefg"):
@@ -192,6 +193,48 @@ def page_lines(chars):
     return out
 
 
+def match_catalog_title(text, catalog, seen_titles):
+    """
+    基于官方目录精确反推章节标题（最高优先级）：
+    对比正文行是否命中尚未出现过的目录条目，支持标题与段首相连时的自动剥离。
+    返回: (匹配到的标题, 剥离标题后剩余的正文内容) 或 (None, text)
+    """
+    clean_text = norm(text)
+    if not clean_text or len(clean_text) < 2:
+        return None, text
+
+    for cat in catalog:
+        if cat in seen_titles:
+            continue
+        clean_cat = norm(cat)
+        if not clean_cat or len(clean_cat) < 2:
+            continue
+
+        # 1. 独立一行完全匹配目录标题
+        if clean_text == clean_cat:
+            return cat, ""
+
+        # 2. 标题在行首，且整行长度很短（<= 目录长度 + 4 个字）
+        if clean_text.startswith(clean_cat) and len(clean_text) <= len(clean_cat) + 4:
+            return cat, ""
+
+        # 3. 标题与首段正文粘连（例如：'第2章 般若品第二次日，韦使君请益...'）
+        if clean_text.startswith(clean_cat) and len(clean_cat) >= 3:
+            # 找到原文本中标题结束的位置
+            # 用原字符逐个匹配
+            c_idx = 0
+            t_idx = 0
+            while c_idx < len(cat) and t_idx < len(text):
+                if norm(text[t_idx]) == norm(cat[c_idx]):
+                    c_idx += 1
+                t_idx += 1
+            if c_idx >= len(cat) * 0.8:
+                remainder = text[t_idx:].lstrip("：:、.· 　")
+                return cat, remainder
+
+    return None, text
+
+
 def render_md(title, blocks, ch_idx):
     out = ["# %s\n" % title]
     buf, buf_cls = [], None
@@ -214,7 +257,6 @@ def render_md(title, blocks, ch_idx):
                     out.append(m.strip())
                     out.append("")
         elif buf_cls == "yw":
-            # 引文/条文：自然保留段落，不进行破坏性的数字正则强拆
             joined = "".join(buf)
             out.append('<p class="yw">%s</p>' % joined.strip())
             out.append("")
@@ -267,13 +309,27 @@ async def wait_stable_chars(page, timeout=6.0):
     return last_n
 
 
+async def check_cookies_login(ctx):
+    """基于真实鉴权凭证检查登录态，彻底避免访客目录误判"""
+    try:
+        cookies = await ctx.cookies()
+        names = {c["name"] for c in cookies}
+        return "wr_vid" in names and ("wr_skey" in names or "wr_rt" in names)
+    except Exception:
+        return False
+
+
 async def launch_browser_context(p, user_data_dir, headless=False):
-    """自动检测可用浏览器：优先使用 Playwright Chromium，若未下载则免下载直连系统自带的 Edge 或 Chrome"""
-    candidates = [
-        {"name": "Playwright Chromium", "channel": None},
+    """自动检测可用浏览器：优先环境变量/系统自带的 Edge/Chrome，免下载 200MB 浏览器"""
+    custom_ch = os.environ.get("PLAYWRIGHT_CHANNEL")
+    candidates = []
+    if custom_ch:
+        candidates.append({"name": f"自定义 {custom_ch}", "channel": custom_ch})
+    candidates.extend([
         {"name": "系统 Microsoft Edge", "channel": "msedge"},
         {"name": "系统 Google Chrome", "channel": "chrome"},
-    ]
+        {"name": "Playwright Chromium", "channel": None},
+    ])
     for c in candidates:
         try:
             kwargs = {
@@ -316,29 +372,24 @@ async def main(book_id_or_url):
         target_url = f"https://weread.qq.com/web/reader/{book_id}"
         print(f"🌐 正在打开书籍阅读页: {target_url} ...", flush=True)
         await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(4)
+        await asyncio.sleep(3)
 
-        # 检测登录状态
-        logged_in = False
-        if await page.locator(".readerControls_item.catalog").count() > 0:
-            logged_in = True
-        else:
-            print("\n" + "="*50)
-            print("👉 请在弹出的浏览器窗口中使用【微信扫码登录】微信读书（限时 120 秒）...")
-            print("="*50 + "\n", flush=True)
-            for _ in range(60):
+        # 登录判定：严格使用 Cookie 凭证
+        if not await check_cookies_login(ctx):
+            print("\n" + "="*55)
+            print("👉 检测到未登录或登录已过期，请在浏览器中使用【微信扫码】（限时 300 秒）...")
+            print("="*55 + "\n", flush=True)
+            for sec in range(1, 151):
                 await asyncio.sleep(2)
-                if await page.locator(".readerControls_item.catalog").count() > 0:
-                    logged_in = True
+                if await check_cookies_login(ctx):
                     print("✅ 登录成功，继续执行抓取...", flush=True)
                     break
+            else:
+                print("❌ 扫码登录超时（300秒），导出终止。请重新运行并在弹出的窗口中扫码！", flush=True)
+                await ctx.close()
+                return False
 
-        if not logged_in:
-            print("❌ 扫码登录超时，请重新运行脚本并在弹出的窗口中扫码！", flush=True)
-            await ctx.close()
-            return False
-
-        # 强制切换为双栏水平翻页模式
+        # 确保处于双栏水平翻页模式
         if await page.locator("button.readerControls_item.isNormalReader").count() > 0:
             print("🔄 切换至双栏翻页模式...", flush=True)
             await page.click("button.readerControls_item.isNormalReader")
@@ -364,7 +415,6 @@ async def main(book_id_or_url):
         if book_meta.get("author"):
             print(f"✍️ 作者: {book_meta.get('author')}")
 
-        # 下载原版高清封面图 cover.jpg
         cover_url = book_meta.get("cover")
         if cover_url:
             cover_path = os.path.join(book_dir, "cover.jpg")
@@ -378,7 +428,7 @@ async def main(book_id_or_url):
             except Exception as e:
                 print(f"⚠️ 封面下载跳过: {e}")
 
-        # 读取目录列表
+        # 读取完整目录列表
         await page.click("button.readerControls_item.catalog", timeout=8000)
         await asyncio.sleep(1.5)
         items = page.locator(".readerCatalog_list_item")
@@ -387,28 +437,33 @@ async def main(book_id_or_url):
         for i in range(n):
             txt = (await items.nth(i).inner_text()).strip().replace("\n", " ")
             txt = re.sub(r"\s*当前读到.*$", "", txt).strip()
-            catalog.append(txt)
+            if txt:
+                catalog.append(txt)
         with open(os.path.join(book_dir, "_catalog.json"), "w", encoding="utf-8") as f:
             json.dump(catalog, f, ensure_ascii=False, indent=2)
         print(f"📑 目录共 {n} 项: {catalog[:3]} ... {catalog[-2:] if n > 3 else ''}", flush=True)
 
-        # 跳回第 0 项（从扉页/第一章开始）
+        # 修复起始页丢失问题：直接平稳导航回第 0 项（首章/扉页），不搞多余切换
         if n > 0:
             it0 = items.nth(0)
             await it0.scroll_into_view_if_needed()
             await asyncio.sleep(0.3)
-            await page.evaluate("() => window.__wr_drain()")
             await it0.click(timeout=5000)
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.0)
             try:
+                # 确保关闭目录面板，不遮挡阅读区
                 if await page.locator(".readerCatalog_list_item").first.is_visible():
                     await page.click("button.readerControls_item.catalog", timeout=2000)
             except Exception:
                 await page.keyboard.press("Escape")
             await asyncio.sleep(1.0)
 
+        # 等待首屏渲染稳定后再清空/重置缓冲区，确保首页 100% 捕获
+        await wait_stable_chars(page, timeout=5.0)
+
         sections = []
         cur_title = catalog[0] if catalog else "扉页"
+        seen_titles = {cur_title}
         buf = []
         stale = 0
         seen_last = False
@@ -417,8 +472,13 @@ async def main(book_id_or_url):
         seen_page_sigs = set()
         seen_imgs = set()
 
+        total_words_accum = 0
+        t_start = time.time()
         long_pause_at = next_long_pause_at(0)
-        # 支持长篇大部头图书（最多 5000 步）
+
+        print("\n🚀 开始遍历全书页面...", flush=True)
+
+        # 循环翻页（支持超长图书）
         for step in range(5000):
             if step > 0:
                 await page.mouse.click(600, 450)
@@ -440,6 +500,9 @@ async def main(book_id_or_url):
             right_imgs = [im for im in imgs if im["left"] >= 600]
 
             got_any = False
+            step_words = 0
+            page_payload = []
+
             for side, pchars in pages:
                 lines = page_lines(pchars)
                 if not lines:
@@ -452,20 +515,43 @@ async def main(book_id_or_url):
                 got_any = True
 
                 for ln in lines:
-                    if ln["cls"] == "title":
-                        t = ln["text"].strip()
-                        if norm(t) != norm(cur_title):
-                            if buf:
-                                sections.append((cur_title, buf))
-                            buf = []
-                            cur_title = t
-                            print(f"  ▶ [第 {step} 步] 进入章节: {t}", flush=True)
-                            if last_cat and norm(t) == last_cat:
-                                seen_last = True
+                    txt = ln["text"].strip()
+                    step_words += len(txt)
+
+                    # 🌟 核心改进：用目录反推章节切分，支持粘连剥离
+                    matched_title, remainder = match_catalog_title(txt, catalog, seen_titles)
+
+                    # 若目录匹配命中，或行属性判定为 title
+                    is_new_chapter = False
+                    new_title = ""
+                    if matched_title and norm(matched_title) != norm(cur_title):
+                        is_new_chapter = True
+                        new_title = matched_title
+                    elif ln["cls"] == "title" and norm(txt) != norm(cur_title) and len(txt) <= 40:
+                        is_new_chapter = True
+                        new_title = txt
+
+                    if is_new_chapter:
+                        if buf:
+                            sections.append((cur_title, buf))
+                        buf = []
+                        cur_title = new_title
+                        seen_titles.add(cur_title)
+                        print(f"\n  📑 [第 {step:03d} 页] 识别章节: 《{cur_title}》", flush=True)
+                        if last_cat and norm(cur_title) == last_cat:
+                            seen_last = True
+
+                        # 如果标题后还连着首段正文，将正文压入新章节
+                        if remainder:
+                            buf.append({"type": "line", "cls": "js", "text": remainder})
                         continue
-                    if buf and buf[-1]["type"] == "line" and buf[-1]["text"] == ln["text"] and buf[-1]["cls"] == ln["cls"]:
+
+                    # 避免同页内重复行
+                    if buf and buf[-1]["type"] == "line" and buf[-1]["text"] == txt and buf[-1]["cls"] == ln["cls"]:
                         continue
-                    buf.append({"type": "line", "cls": ln["cls"], "text": ln["text"]})
+
+                    buf.append({"type": "line", "cls": ln["cls"], "text": txt})
+                    page_payload.append(txt)
 
                 side_imgs = left_imgs if side == 0 else right_imgs
                 for im in side_imgs:
@@ -481,8 +567,20 @@ async def main(book_id_or_url):
                         buf.append({"type": "img", "src": im["src"]})
                         got_any = True
 
+            total_words_accum += step_words
+
+            # 🌟 核心改进：逐页落盘保护（断点保护）
+            if got_any:
+                page_file = os.path.join(raw_dir, f"page_{step:04d}.json")
+                with open(page_file, "w", encoding="utf-8") as pf:
+                    json.dump({"step": step, "chapter": cur_title, "words": step_words, "lines": page_payload}, pf, ensure_ascii=False)
+
+            # 🌟 核心改进：实时可见的友好进度输出
+            elapsed_sec = int(time.time() - t_start)
+            elapsed_str = f"{elapsed_sec // 60}分{elapsed_sec % 60}秒"
             if got_any:
                 stale = 0
+                print(f"  [进度 第 {step:03d} 页] 本页 +{step_words:3d} 字 | 累计 {total_words_accum:6d} 字 | 所在: 《{cur_title[:12]}》 | 已用时 {elapsed_str}", flush=True)
                 if seen_last:
                     last_after_seen += 1
                     if last_after_seen >= 4:
@@ -491,15 +589,16 @@ async def main(book_id_or_url):
             else:
                 stale += 1
                 if seen_last and stale >= 2:
-                    print("  🏁 已到达末章且无新内容", flush=True)
+                    print("  🏁 已到达末章且无新内容，抓取完成", flush=True)
                     break
                 if stale >= 8:
-                    print(f"  连续 {stale} 页无新内容，判定全书抓取结束", flush=True)
+                    print(f"  🏁 连续 {stale} 页无新内容，判定全书抓取结束", flush=True)
                     break
 
         if cur_title and buf:
             sections.append((cur_title, buf))
 
+        # 合并同名章节（若偶发重复）
         merged_sections = []
         for t, b in sections:
             if merged_sections and norm(merged_sections[-1][0]) == norm(t):
@@ -507,30 +606,32 @@ async def main(book_id_or_url):
             else:
                 merged_sections.append((t, b))
 
-        print(f"\n✅ 抓取汇总: 共捕获 {len(merged_sections)} 节", flush=True)
+        print(f"\n" + "="*50)
+        print(f"🎉 抓取成功！全书共识别出 {len(merged_sections)} 个章节:")
+        print("="*50)
         total_words = 0
         saved_idx = 0
         for t, blocks in merged_sections:
             saved_idx += 1
             body, im_list = render_md(t, blocks, saved_idx)
             txt_len = len(re.sub(r"<[^>]+>", "", body))
-            if txt_len < 15 and not im_list:
+            if txt_len < 15 and not im_list and saved_idx > 1:
                 saved_idx -= 1
                 continue
             with open(os.path.join(md_dir, "%04d.md" % saved_idx), "w", encoding="utf-8") as f:
                 f.write(body)
-            with open(os.path.join(raw_dir, "%04d.json" % saved_idx), "w", encoding="utf-8") as f:
+            with open(os.path.join(raw_dir, "chap_%04d.json" % saved_idx), "w", encoding="utf-8") as f:
                 json.dump({"title": t, "images": im_list, "text_len": txt_len}, f, ensure_ascii=False)
             total_words += txt_len
             print(f"  [{saved_idx:02d}] {t[:28]:<28} {txt_len:6d} 字 | {len(im_list)} 图", flush=True)
 
-        print(f"🎉 全书合计 {total_words} 字，已保存至 chapters/ 目录", flush=True)
+        print(f"\n📊 统计: 全书合计 {total_words} 字，已保存至 chapters/ 目录", flush=True)
         await ctx.close()
 
-    # 批量下载章节插图
+    # 下载章节插图
     tasks = []
     for jf in sorted(os.listdir(raw_dir)):
-        if jf.endswith(".json"):
+        if jf.startswith("chap_") and jf.endswith(".json"):
             with open(os.path.join(raw_dir, jf), encoding="utf-8") as f:
                 for im in json.load(f).get("images", []):
                     tasks.append((im["src"], im["name"]))
