@@ -4,10 +4,8 @@
 核心特性：
 1. 自动切换至双栏水平翻页模式，解决网页端上下滚动模式下因虚拟滚动分片导致章节下半部分漏字的问题。
 2. 捕获 Canvas 2D 绘制指令与分栏坐标，精准切分每一单页，消除跨页文字重复或交错。
-3. 自动识别画布字号与字重层级（标题 / 独立引文 / 加粗段落 / 正文），并下载原书全部高清插图。
-
-用法:
-    python crawl_weread.py <book_id>
+3. 自动抓取书籍元数据（书名、作者、简介）并下载原版高清封面（cover.jpg）。
+4. 智能适配系统内置 Edge / Chrome，免去下载 200MB 浏览器的漫长等待。
 """
 import asyncio
 import collections
@@ -32,6 +30,24 @@ LONG_PAUSE_RANGE = (60.0, 120.0)     # 长停顿时长（秒）
 
 def next_long_pause_at(step):
     return step + random.randint(*LONG_PAUSE_EVERY)
+
+
+def extract_book_id(raw_input):
+    """从纯 ID、完整网页链接或带参数的分享链接中智能提取书籍 ID"""
+    if not raw_input:
+        return ""
+    text = str(raw_input).strip()
+    m = re.search(r"(?:reader|bookDetail)/([a-zA-Z0-9_-]+)", text)
+    if m:
+        return m.group(1)
+    # 如果是纯 ID（数字、英文字符组合，长度大于 6）
+    m_id = re.search(r"^[a-zA-Z0-9_-]{6,36}$", text)
+    if m_id:
+        return m_id.group(0)
+    # 兜底：剥离 URL 前缀与查询参数
+    clean = re.sub(r"^https?://[^/]+/", "", text).split("?")[0].strip("/")
+    return clean or text
+
 
 HOOK = """
 (function() {
@@ -198,11 +214,10 @@ def render_md(title, blocks, ch_idx):
                     out.append(m.strip())
                     out.append("")
         elif buf_cls == "yw":
+            # 引文/条文：自然保留段落，不进行破坏性的数字正则强拆
             joined = "".join(buf)
-            for p in re.split(r"(?<=[。！？；”」])(?=\d{1,3}[^\d])", joined):
-                if p.strip():
-                    out.append('<p class="yw">%s</p>' % p.strip())
-                    out.append("")
+            out.append('<p class="yw">%s</p>' % joined.strip())
+            out.append("")
         elif buf_cls == "fang":
             for line in buf:
                 if line.strip():
@@ -253,7 +268,7 @@ async def wait_stable_chars(page, timeout=6.0):
 
 
 async def launch_browser_context(p, user_data_dir, headless=False):
-    """自动检测可用浏览器：优先使用已安装的 Chromium，若未下载则自动免下载回退到系统自带的 Edge 或 Chrome"""
+    """自动检测可用浏览器：优先使用 Playwright Chromium，若未下载则免下载直连系统自带的 Edge 或 Chrome"""
     candidates = [
         {"name": "Playwright Chromium", "channel": None},
         {"name": "系统 Microsoft Edge", "channel": "msedge"},
@@ -272,53 +287,98 @@ async def launch_browser_context(p, user_data_dir, headless=False):
             return ctx
         except Exception:
             continue
-    raise RuntimeError("未检测到可用浏览器，请运行: pip install playwright && playwright install chromium")
+    raise RuntimeError("未检测到可用浏览器，请安装 Google Chrome 或 Microsoft Edge，或执行: playwright install chromium")
 
 
-async def main(book_id):
+async def main(book_id_or_url):
+    book_id = extract_book_id(book_id_or_url)
+    if not book_id:
+        print("❌ 错误: 未能解析出有效的微信读书书籍 ID 或链接")
+        return False
+
     book_dir = os.path.join(BASE, "output", book_id + "_v2")
     md_dir = os.path.join(book_dir, "chapters")
     raw_dir = os.path.join(book_dir, "raw")
     img_dir = os.path.join(book_dir, "images")
 
-    for d in (md_dir, raw_dir):
-        os.makedirs(d, exist_ok=True)
-        for fn in os.listdir(d):
-            fp = os.path.join(d, fn)
-            if os.path.isfile(fp):
-                os.remove(fp)
+    os.makedirs(md_dir, exist_ok=True)
+    os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+    print(f"📖 目标书籍 ID: {book_id}")
 
     async with async_playwright() as p:
         ctx = await launch_browser_context(p, USER_DATA_DIR, headless=False)
         page = await ctx.new_page()
         await page.add_init_script(HOOK)
-        await page.goto("https://weread.qq.com/web/reader/%s" % book_id,
-                        wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(5)
 
-        # 若未登录，等待用户扫码登录
-        if await page.locator("text=登录").count() > 0 and await page.locator(".readerControls_item.catalog").count() == 0:
-            print("请在弹出的浏览器窗口中扫码登录微信读书（限时 120 秒）...", flush=True)
+        target_url = f"https://weread.qq.com/web/reader/{book_id}"
+        print(f"🌐 正在打开书籍阅读页: {target_url} ...", flush=True)
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(4)
+
+        # 检测登录状态
+        logged_in = False
+        if await page.locator(".readerControls_item.catalog").count() > 0:
+            logged_in = True
+        else:
+            print("\n" + "="*50)
+            print("👉 请在弹出的浏览器窗口中使用【微信扫码登录】微信读书（限时 120 秒）...")
+            print("="*50 + "\n", flush=True)
             for _ in range(60):
                 await asyncio.sleep(2)
                 if await page.locator(".readerControls_item.catalog").count() > 0:
+                    logged_in = True
+                    print("✅ 登录成功，继续执行抓取...", flush=True)
                     break
+
+        if not logged_in:
+            print("❌ 扫码登录超时，请重新运行脚本并在弹出的窗口中扫码！", flush=True)
+            await ctx.close()
+            return False
 
         # 强制切换为双栏水平翻页模式
         if await page.locator("button.readerControls_item.isNormalReader").count() > 0:
-            print("切换至双栏翻页模式...", flush=True)
+            print("🔄 切换至双栏翻页模式...", flush=True)
             await page.click("button.readerControls_item.isNormalReader")
-            await asyncio.sleep(4)
+            await asyncio.sleep(3)
 
-        # 提取书籍标题等元数据
-        book_title = (await page.title()).replace(" - 微信读书", "").strip()
+        # 抓取完整的书籍元数据与原版高清封面
+        book_meta = await page.evaluate("""() => {
+            let info = (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.reader && window.__INITIAL_STATE__.reader.bookInfo) || {};
+            return {
+                title: info.title || document.title.replace(' - 微信读书', '').trim(),
+                author: info.author || '',
+                cover: info.cover || '',
+                intro: info.intro || '',
+                publisher: info.publisher || ''
+            };
+        }""")
+        book_meta["book_id"] = book_id
         meta_file = os.path.join(book_dir, "meta.json")
         with open(meta_file, "w", encoding="utf-8") as f:
-            json.dump({"title": book_title, "book_id": book_id}, f, ensure_ascii=False, indent=2)
+            json.dump(book_meta, f, ensure_ascii=False, indent=2)
 
-        # 读取目录并跳回第 0 项
+        print(f"📚 书名: {book_meta.get('title')}")
+        if book_meta.get("author"):
+            print(f"✍️ 作者: {book_meta.get('author')}")
+
+        # 下载原版高清封面图 cover.jpg
+        cover_url = book_meta.get("cover")
+        if cover_url:
+            cover_path = os.path.join(book_dir, "cover.jpg")
+            try:
+                req = urllib.request.Request(cover_url, headers={"Referer": "https://weread.qq.com/", "User-Agent": "Mozilla/5.0"})
+                raw = urllib.request.urlopen(req, timeout=15).read()
+                if len(raw) > 500:
+                    with open(cover_path, "wb") as f:
+                        f.write(raw)
+                    print("🖼️ 原版高清封面下载完成")
+            except Exception as e:
+                print(f"⚠️ 封面下载跳过: {e}")
+
+        # 读取目录列表
         await page.click("button.readerControls_item.catalog", timeout=8000)
         await asyncio.sleep(1.5)
         items = page.locator(".readerCatalog_list_item")
@@ -330,26 +390,22 @@ async def main(book_id):
             catalog.append(txt)
         with open(os.path.join(book_dir, "_catalog.json"), "w", encoding="utf-8") as f:
             json.dump(catalog, f, ensure_ascii=False, indent=2)
-        print("目录共 %d 项: %s ... %s" % (n, catalog[:3], catalog[-2:]), flush=True)
+        print(f"📑 目录共 {n} 项: {catalog[:3]} ... {catalog[-2:] if n > 3 else ''}", flush=True)
 
-        if n > 2:
-            await items.nth(2).click(timeout=5000)
+        # 跳回第 0 项（从扉页/第一章开始）
+        if n > 0:
+            it0 = items.nth(0)
+            await it0.scroll_into_view_if_needed()
+            await asyncio.sleep(0.3)
+            await page.evaluate("() => window.__wr_drain()")
+            await it0.click(timeout=5000)
             await asyncio.sleep(2.0)
-            if not await page.locator(".readerCatalog_list_item").first.is_visible():
-                await page.click("button.readerControls_item.catalog", timeout=5000)
-                await asyncio.sleep(1.0)
-        it0 = items.nth(0)
-        await it0.scroll_into_view_if_needed()
-        await asyncio.sleep(0.3)
-        await page.evaluate("() => window.__wr_drain()")
-        await it0.click(timeout=5000)
-        await asyncio.sleep(2.5)
-        try:
-            if await page.locator(".readerCatalog_list_item").first.is_visible():
-                await page.click("button.readerControls_item.catalog", timeout=2000)
-        except Exception:
-            await page.keyboard.press("Escape")
-        await asyncio.sleep(1.0)
+            try:
+                if await page.locator(".readerCatalog_list_item").first.is_visible():
+                    await page.click("button.readerControls_item.catalog", timeout=2000)
+            except Exception:
+                await page.keyboard.press("Escape")
+            await asyncio.sleep(1.0)
 
         sections = []
         cur_title = catalog[0] if catalog else "扉页"
@@ -362,17 +418,16 @@ async def main(book_id):
         seen_imgs = set()
 
         long_pause_at = next_long_pause_at(0)
-        for step in range(1200):
+        # 支持长篇大部头图书（最多 5000 步）
+        for step in range(5000):
             if step > 0:
                 await page.mouse.click(600, 450)
                 await page.keyboard.press("ArrowRight")
-                # 随机翻页延迟（8~20 秒）
                 delay = random.uniform(*PAGE_DELAY_RANGE)
                 await asyncio.sleep(delay)
-                # 每 10~20 页加入 1~2 分钟的长停顿
                 if step >= long_pause_at:
                     pause = random.uniform(*LONG_PAUSE_RANGE)
-                    print("  ⏸ 已翻 %d 页，长停顿 %.0f 秒..." % (step, pause), flush=True)
+                    print(f"  ⏸ 已抓取 {step} 页，触发温和长停顿 {pause:.0f} 秒...", flush=True)
                     await asyncio.sleep(pause)
                     long_pause_at = next_long_pause_at(step)
 
@@ -404,12 +459,11 @@ async def main(book_id):
                                 sections.append((cur_title, buf))
                             buf = []
                             cur_title = t
-                            print("  ▶ [step %3d] %s" % (step, t), flush=True)
+                            print(f"  ▶ [第 {step} 步] 进入章节: {t}", flush=True)
                             if last_cat and norm(t) == last_cat:
                                 seen_last = True
                         continue
-                    if buf and buf[-1]["type"] == "line" and buf[-1]["text"] == ln["text"] \
-                            and buf[-1]["cls"] == ln["cls"]:
+                    if buf and buf[-1]["type"] == "line" and buf[-1]["text"] == ln["text"] and buf[-1]["cls"] == ln["cls"]:
                         continue
                     buf.append({"type": "line", "cls": ln["cls"], "text": ln["text"]})
 
@@ -432,15 +486,15 @@ async def main(book_id):
                 if seen_last:
                     last_after_seen += 1
                     if last_after_seen >= 4:
-                        print("  末章已抓完，结束", flush=True)
+                        print("  🏁 末章内容已抓取完成", flush=True)
                         break
             else:
                 stale += 1
                 if seen_last and stale >= 2:
-                    print("  已达末章且无新内容，结束", flush=True)
+                    print("  🏁 已到达末章且无新内容", flush=True)
                     break
                 if stale >= 8:
-                    print("  连续 %d 页无新内容，结束" % stale, flush=True)
+                    print(f"  连续 {stale} 页无新内容，判定全书抓取结束", flush=True)
                     break
 
         if cur_title and buf:
@@ -453,8 +507,8 @@ async def main(book_id):
             else:
                 merged_sections.append((t, b))
 
-        print("\n共捕获 %d 节:" % len(merged_sections), flush=True)
-        total = 0
+        print(f"\n✅ 抓取汇总: 共捕获 {len(merged_sections)} 节", flush=True)
+        total_words = 0
         saved_idx = 0
         for t, blocks in merged_sections:
             saved_idx += 1
@@ -467,11 +521,13 @@ async def main(book_id):
                 f.write(body)
             with open(os.path.join(raw_dir, "%04d.json" % saved_idx), "w", encoding="utf-8") as f:
                 json.dump({"title": t, "images": im_list, "text_len": txt_len}, f, ensure_ascii=False)
-            total += txt_len
-            print("  [%02d] %-30s %6d字 %d图" % (saved_idx, t[:30], txt_len, len(im_list)), flush=True)
-        print("全书合计 %d 字，%d 节" % (total, saved_idx), flush=True)
+            total_words += txt_len
+            print(f"  [{saved_idx:02d}] {t[:28]:<28} {txt_len:6d} 字 | {len(im_list)} 图", flush=True)
+
+        print(f"🎉 全书合计 {total_words} 字，已保存至 chapters/ 目录", flush=True)
         await ctx.close()
 
+    # 批量下载章节插图
     tasks = []
     for jf in sorted(os.listdir(raw_dir)):
         if jf.endswith(".json"):
@@ -485,20 +541,21 @@ async def main(book_id):
             ok_img += 1
             continue
         try:
-            req = urllib.request.Request(url, headers={
-                "Referer": "https://weread.qq.com/", "User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(url, headers={"Referer": "https://weread.qq.com/", "User-Agent": "Mozilla/5.0"})
             raw = urllib.request.urlopen(req, timeout=20).read()
             if len(raw) > 500:
                 with open(fp, "wb") as f:
                     f.write(raw)
                 ok_img += 1
         except Exception as e:
-            print("  图片下载失败 %s: %s" % (name, e), flush=True)
-    print("图片下载完成: %d/%d" % (ok_img, len(tasks)), flush=True)
+            print(f"  图片下载跳过 {name}: {e}")
+    if tasks:
+        print(f"🖼️ 章节配图下载完成: {ok_img}/{len(tasks)}", flush=True)
+    return True
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python crawl_weread.py <book_id>")
+        print("用法: python crawl_weread.py <微信读书链接或ID>")
         sys.exit(1)
     asyncio.run(main(sys.argv[1]))

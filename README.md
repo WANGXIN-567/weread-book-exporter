@@ -41,32 +41,34 @@
 
 ## 🚀 快速开始
 
-### 1. 安装依赖（国内极速安装）
+### 1. 安装依赖（国内极速安装，仅需几秒）
 
 ```bash
-# 使用清华源极速安装依赖（几秒钟完成）
+# 克隆仓库
+git clone https://github.com/WANGXIN-567/weread-book-exporter.git
+cd weread-book-exporter
+
+# 使用国内镜像极速安装依赖（几秒钟完成）
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-> ⚡ **免下载大浏览器**：脚本已内置智能检测机制，会自动免下载直连系统自带的 **Microsoft Edge** 或 **Google Chrome**；如果系统未安装上述浏览器，可执行 `playwright install chromium` 补充官方内核。
+> ⚡ **免下载 200MB 浏览器**：代码内置了智能浏览器检测，会自动直接调用电脑自带的 **Microsoft Edge** 或 **Google Chrome**；如果系统未安装上述浏览器，可执行 `playwright install chromium` 补充下载。
 
-### 2. 第一步：抓取全书正文与插图
+### 2. 一键抓取并导出全格式电子书（核心推荐）
 
-在微信读书网页版打开目标书籍，从浏览器地址栏复制末段的书籍 ID（例如 `https://weread.qq.com/web/reader/<book_id>`）：
-
-```bash
-python crawl_weread.py <book_id>
-```
-
-> **提示**：首次运行时会弹出浏览器窗口，使用微信扫码登录即可。登录凭证仅保存在本地 `cache/` 目录（已通过 `.gitignore` 忽略），后续使用无需重复扫码。
-
-### 3. 第二步：导出 PDF / EPUB / Markdown
+直接复制微信读书网页版的完整链接（支持任意已购/会员书籍）：
 
 ```bash
-python export_book.py <book_id>
+# 直接粘贴整条网页链接（或书籍 ID 均可）：
+python main.py https://weread.qq.com/web/reader/3b132980813ab94eeg013129
 ```
 
-导出完成后，生成的 `.pdf`、`.epub` 与 `.md` 文件均位于 `output/` 目录下。
+> **提示**：
+> - 首次运行时会自动弹出浏览器窗口，使用微信扫码登录一次即可。
+> - 脚本会自动完成「全书章节遍历 ➔ 原版高清封面下载 ➔ 插图下载 ➔ 精排 PDF 渲染 ➔ 双字体 EPUB 导出 ➔ Markdown 笔记生成」全流程！
+> - 所有文件最终保存在 `output/` 目录下。
+
+*(高级用法：如需分步运行，也可单独执行 `python crawl_weread.py <链接或ID>` 与 `python export_book.py <链接或ID>`)*
 
 ---
 

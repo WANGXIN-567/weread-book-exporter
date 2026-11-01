@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """WeRead Multi-Format Book Exporter (export_book.py)
 
-支持将 crawl_weread.py 抓取的书籍章节一键导出为：
-1. 纯 Markdown 笔记版 (.md)：引文采用 `>` 引用块，适合 Obsidian / Notion。
-2. HTML 样式版 Markdown (.md)：保留段落样式标签。
-3. 双字体精排 EPUB (.epub)：内嵌多字体样式与全部插图。
-4. 大字号精排 PDF (.pdf)：苹方正文 + 楷体引文，含封面、可点击目录、PDF 书签大纲、插图与页码。
-
-用法:
-    python export_book.py <book_id>
+将已抓取的书籍章节一键导出为：
+1. 纯 Markdown 笔记版 (.md)：引用块格式，适配 Obsidian / Notion / Logseq
+2. HTML 样式版 Markdown (.md)：保留精细排版语义标签
+3. 标准 EPUB 电子书 (.epub)：双字体 CSS 排版，内嵌目录树与原书高清配图
+4. 大字号出版级精排 PDF (.pdf)：跨平台字体栈（Mac/Win/Linux），带封面、可点击目录、侧边栏书签大纲与页码
 """
 import asyncio
 import base64
@@ -21,17 +18,27 @@ import sys
 from playwright.async_api import async_playwright
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-
 FANG_P = re.compile(r'^<p class="fang">(.*)</p>$')
 SENT_END = re.compile(r'[。！？；：…”）》」]$')
-FANG_TITLE_RE = re.compile(
-    r'(?:^|(?<=[。！？]))\s*([^\s，。；：（）()]{1,14}?(?:汤|散|丸|饮|丹|膏|煎|酒)方(?:（方佚）)?)'
-)
-JIANFU_RE = re.compile(r'((?:上|右)[一二三四五六七八九十百]+味[，、,])')
+
+
+def extract_book_id(raw_input):
+    """从纯 ID、完整网页链接或带参数的分享链接中提取书籍 ID"""
+    if not raw_input:
+        return ""
+    text = str(raw_input).strip()
+    m = re.search(r"(?:reader|bookDetail)/([a-zA-Z0-9_-]+)", text)
+    if m:
+        return m.group(1)
+    m_id = re.search(r"^[a-zA-Z0-9_-]{6,36}$", text)
+    if m_id:
+        return m_id.group(0)
+    clean = re.sub(r"^https?://[^/]+/", "", text).split("?")[0].strip("/")
+    return clean or text
 
 
 def refine_chapter_text(text):
-    """智能识别真方剂、合并段中断句、修复被插图或加粗打断的跨行句子"""
+    """通用文本清洗：合并被画布折行打断的跨段句子，修复插图穿插导致的断句"""
     raw_lines = [l.strip() for l in text.split("\n") if l.strip()]
     blocks = []
     i = 0
@@ -49,14 +56,8 @@ def refine_chapter_text(text):
             joined = "".join(fang_parts)
             prev = blocks[-1] if blocks else ""
 
-            if joined.startswith("师曰："):
-                blocks.append(f'<p class="yw">{joined}</p>')
-                continue
-
-            if prev.strip() == "桂枝汤方":
-                blocks.pop()
-                blocks.append(f'<p class="fang">桂枝汤方{joined}</p>')
-            elif prev.endswith("</p>"):
+            # 若前一行是未闭合的标题/段落，则根据语意并入
+            if prev.endswith("</p>"):
                 blocks.append(f'<p class="fang">{joined}</p>')
             else:
                 bold_seg = f"**{joined}**"
@@ -120,26 +121,28 @@ def read_book(book_id):
 
     seen_hash = set()
     chaps = []
-    for fn in sorted(os.listdir(ch_dir)):
-        if not fn.endswith(".md"):
-            continue
-        p = os.path.join(ch_dir, fn)
-        with open(p, encoding="utf-8") as f:
-            text = f.read()
-        h = hashlib.md5(text.encode("utf-8")).hexdigest()
-        if h in seen_hash:
-            continue
-        seen_hash.add(h)
-        chaps.append(text)
+    if os.path.isdir(ch_dir):
+        for fn in sorted(os.listdir(ch_dir)):
+            if not fn.endswith(".md"):
+                continue
+            p = os.path.join(ch_dir, fn)
+            with open(p, encoding="utf-8") as f:
+                text = f.read()
+            h = hashlib.md5(text.encode("utf-8")).hexdigest()
+            if h in seen_hash:
+                continue
+            seen_hash.add(h)
+            chaps.append(text)
     return root, heads + chaps
 
 
-def build_markdown_files(book_id, texts):
+def build_markdown_files(book_id, title, texts):
     out_dir = os.path.join(BASE, "output")
     os.makedirs(out_dir, exist_ok=True)
     refined = [refine_chapter_text(t) for t in texts]
 
-    html_md_path = os.path.join(out_dir, f"{book_id}_全书合并_楷体标签版.md")
+    safe_title = re.sub(r'[<>:"/\\|?*]', "_", title) or book_id
+    html_md_path = os.path.join(out_dir, f"{safe_title}_全书合并_HTML排版版.md")
     with open(html_md_path, "w", encoding="utf-8") as f:
         f.write("\n\n---\n\n".join(refined))
 
@@ -149,28 +152,21 @@ def build_markdown_files(book_id, texts):
         t = re.sub(r'<p class="fang">(.*?)</p>', r'> *\1*', t)
         pure_chaps.append(t)
 
-    pure_md_path = os.path.join(out_dir, f"{book_id}_纯Markdown学习版.md")
+    pure_md_path = os.path.join(out_dir, f"{safe_title}_纯Markdown笔记版.md")
     with open(pure_md_path, "w", encoding="utf-8") as f:
         f.write("\n\n---\n\n".join(pure_chaps))
 
-    print(f"Markdown 导出完成:\n  - {html_md_path}\n  - {pure_md_path}", flush=True)
+    print(f"📄 Markdown 笔记生成完成:\n  - {pure_md_path}", flush=True)
+    return pure_md_path
 
 
-def build_epub(book_id, root, texts):
+def build_epub(book_id, root, title, author, texts):
     try:
         import markdown
         from ebooklib import epub
     except ImportError:
-        print("未安装 markdown 或 EbookLib，跳过 EPUB 生成（pip install markdown EbookLib）", flush=True)
-        return
-
-    meta_path = os.path.join(root, "meta.json")
-    title, author = f"Book_{book_id}", ""
-    if os.path.isfile(meta_path):
-        with open(meta_path, encoding="utf-8") as f:
-            m = json.load(f)
-            title = m.get("title", title)
-            author = m.get("author", author)
+        print("💡 提示: 未安装 markdown 或 EbookLib，跳过 EPUB 格式生成（可通过 pip install markdown EbookLib 安装）", flush=True)
+        return None
 
     book = epub.EpubBook()
     book.set_identifier("weread-" + book_id)
@@ -218,10 +214,11 @@ def build_epub(book_id, root, texts):
     book.add_item(epub.EpubNav())
     book.spine = ["nav"] + items
 
-    safe = re.sub(r'[<>:"/\\|?*]', "_", title)
-    out_epub = os.path.join(BASE, "output", f"{safe}（原文楷体版）.epub")
+    safe = re.sub(r'[<>:"/\\|?*]', "_", title) or book_id
+    out_epub = os.path.join(BASE, "output", f"{safe}（双字体精排）.epub")
     epub.write_epub(out_epub, book)
-    print(f"EPUB 导出完成: {out_epub}", flush=True)
+    print(f"📘 EPUB 电子书生成完成: {out_epub}", flush=True)
+    return out_epub
 
 
 def img_to_data_uri(path):
@@ -234,27 +231,12 @@ def img_to_data_uri(path):
 
 
 def format_yw_html(inner):
-    m = re.match(r"^(\d+)\s*(.*)$", inner)
+    """智能格式化引文/条文卡片：若内容显式以数字编号开头则提取徽章，否则优雅作为高亮引文块展示"""
+    m = re.match(r"^(?:第\s*)?(\d{1,4})\s*(?:条)?[:：\s]*(.*)$", inner)
     if m:
         num, rest = m.group(1), m.group(2)
         return f'<p class="yw"><span class="yw-badge">第 {num} 条</span>{rest}</p>'
     return f'<p class="yw">{inner}</p>'
-
-
-def format_fang_html(inner):
-    html = FANG_TITLE_RE.sub(r'<span class="fang-name">\1</span>', inner)
-    html = JIANFU_RE.sub(r'<span class="fang-jian">\1', html)
-    if '<span class="fang-jian">' in html:
-        parts = html.split('<span class="fang-jian">')
-        rebuilt = [parts[0]]
-        for p in parts[1:]:
-            if '<span class="fang-name">' in p:
-                sub_a, sub_b = p.split('<span class="fang-name">', 1)
-                rebuilt.append(f'<span class="fang-jian">{sub_a}</span><span class="fang-name">{sub_b}')
-            else:
-                rebuilt.append(f'<span class="fang-jian">{p}</span>')
-        html = "".join(rebuilt)
-    return f'<div class="fang-card">{html}</div>'
 
 
 def md_to_html_simple(md_text, img_dir):
@@ -274,7 +256,7 @@ def md_to_html_simple(md_text, img_dir):
             continue
         if line.startswith('<p class="fang">') and line.endswith("</p>"):
             inner = line[len('<p class="fang">'):-len("</p>")].strip()
-            out.append(format_fang_html(inner))
+            out.append(f'<div class="highlight-card">{inner}</div>')
             continue
         line = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
         if re.match(r"^<strong>[^。！？]{2,28}</strong>$", line):
@@ -285,7 +267,7 @@ def md_to_html_simple(md_text, img_dir):
 
 
 async def launch_browser_headless(p):
-    """渲染 PDF 时自动选择可用浏览器：优先默认 Chromium，缺失时免下载直连系统 Edge / Chrome"""
+    """自动选择可用浏览器生成 PDF：优先 Playwright Chromium，缺失时免下载直连系统 Edge / Chrome"""
     for ch in [None, "msedge", "chrome"]:
         try:
             kwargs = {"headless": True}
@@ -294,27 +276,15 @@ async def launch_browser_headless(p):
             return await p.chromium.launch(**kwargs)
         except Exception:
             continue
-    raise RuntimeError("未检测到可用浏览器渲染 PDF，请运行: pip install playwright && playwright install chromium")
+    raise RuntimeError("未检测到可用浏览器渲染 PDF，请安装 Google Chrome 或 Microsoft Edge")
 
 
-async def build_pdf(book_id, root, texts):
+async def build_pdf(book_id, root, title, author, intro, texts):
     img_dir = os.path.join(root, "images")
-    meta_path = os.path.join(root, "meta.json")
     cover_path = os.path.join(root, "cover.jpg")
-
-    title = f"Book_{book_id}"
-    author = ""
-    intro = ""
-    if os.path.isfile(meta_path):
-        with open(meta_path, encoding="utf-8") as f:
-            m = json.load(f)
-            title = m.get("title", title)
-            author = m.get("author", author)
-            intro = m.get("intro", "")
-
     cover_uri = img_to_data_uri(cover_path)
-    toc_items, chap_htmls = [], []
 
+    toc_items, chap_htmls = [], []
     for i, text in enumerate(texts, 1):
         text = refine_chapter_text(text)
         first = text.split("\n", 1)[0]
@@ -338,51 +308,18 @@ async def build_pdf(book_id, root, texts):
 
     cover_img_tag = f'<img class="cover-img" src="{cover_uri}" alt="封面"/>' if cover_uri else ""
     intro_html = "".join(f"<p>{p.strip()}</p>" for p in intro.split("\n") if p.strip())
-    pf_font_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts").replace("\\", "/")
-    win_font_dir = "C:/Windows/Fonts"
 
+    # 跨平台字体加载（Mac/Windows/Linux 全局兼容字体栈）
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"/>
 <title>{title}</title>
 <style>
-@font-face {{
-    font-family: "BookPingFang";
-    src: url("file:///{pf_font_dir}/PingFang%20Regular.ttf") format("truetype"),
-         local("PingFang SC"), local("PingFang Regular");
-    font-weight: 400;
-}}
-@font-face {{
-    font-family: "BookPingFang";
-    src: url("file:///{pf_font_dir}/PingFang%20Medium.ttf") format("truetype"),
-         local("PingFang SC Medium"), local("PingFang Medium");
-    font-weight: 500;
-}}
-@font-face {{
-    font-family: "BookPingFang";
-    src: url("file:///{pf_font_dir}/PingFang%20Bold.ttf") format("truetype"),
-         local("PingFang SC Semibold"), local("PingFang Bold");
-    font-weight: 700;
-}}
-@font-face {{
-    font-family: "BookKaiTi";
-    src: url("file:///{win_font_dir}/STKAITI.TTF") format("truetype"),
-         url("file:///{win_font_dir}/simkai.ttf") format("truetype"),
-         local("STKaiti"), local("KaiTi");
-    font-weight: 400;
-}}
-@font-face {{
-    font-family: "BookKaiTi";
-    src: url("file:///{win_font_dir}/STKAITI.TTF") format("truetype"),
-         url("file:///{win_font_dir}/simkai.ttf") format("truetype"),
-         local("STKaiti"), local("KaiTi");
-    font-weight: 700;
-}}
 @page {{ size: A4; margin: 20mm 16.5mm 19mm 16.5mm; }}
 * {{ box-sizing: border-box; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }}
 body {{
-    font-family: "BookPingFang", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", "WenQuanYi Micro Hei", sans-serif;
     font-size: 13.2pt; line-height: 1.95; letter-spacing: 0.018em; color: #24272b; margin: 0; padding: 0;
 }}
 .cover-page {{
@@ -391,14 +328,14 @@ body {{
     background: linear-gradient(180deg, #fdfbf7 0%, #f7f3ea 100%);
     min-height: 248mm; display: flex; flex-direction: column; justify-content: center; align-items: center;
 }}
-.cover-img {{ max-width: 64mm; height: auto; border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.16); margin-bottom: 9mm; border: 2px solid #fff; }}
-.cover-title {{ font-family: "BookKaiTi", "STKaiti", "KaiTi", serif; font-size: 24pt; font-weight: bold; color: #1c1917; margin: 0 0 3.5mm 0; }}
+.cover-img {{ max-width: 68mm; max-height: 98mm; height: auto; border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.16); margin-bottom: 9mm; border: 2px solid #fff; }}
+.cover-title {{ font-family: "STKaiti", "KaiTi", "Kaiti SC", "SimSun", serif; font-size: 24pt; font-weight: bold; color: #1c1917; margin: 0 0 3.5mm 0; }}
 .cover-author {{ font-size: 13.5pt; font-weight: 500; color: #7c2d12; margin-bottom: 8mm; letter-spacing: 0.12em; }}
 .cover-intro {{ text-align: justify; max-width: 148mm; margin: 0 auto; font-size: 11.2pt; line-height: 1.82; color: #3f3c38; background: rgba(255,255,255,0.78); padding: 5.5mm 7mm; border-left: 4px solid #9e2a2b; border-radius: 4px; }}
 .cover-intro p {{ text-indent: 2em; margin: 0.45em 0; }}
 .toc-page {{ page-break-after: always; padding: 4mm 2mm; }}
 .toc-header {{ text-align: center; margin-bottom: 8mm; }}
-.toc-header h2 {{ font-family: "BookKaiTi", "STKaiti", "KaiTi", serif; font-size: 22pt; margin: 0 0 2.5mm 0; letter-spacing: 0.25em; }}
+.toc-header h2 {{ font-family: "STKaiti", "KaiTi", "Kaiti SC", serif; font-size: 22pt; margin: 0 0 2.5mm 0; letter-spacing: 0.25em; }}
 .toc-sub {{ font-size: 9.5pt; color: #9e2a2b; letter-spacing: 0.2em; font-weight: 500; }}
 .toc-list {{ list-style: none; padding: 0; margin: 0; column-count: 2; column-gap: 10mm; }}
 .toc-list li {{ margin: 2.8mm 0; break-inside: avoid; border-bottom: 1px dashed #dfd8cc; padding-bottom: 1.8mm; }}
@@ -413,26 +350,24 @@ p {{ text-indent: 2em; margin: 0.68em 0; text-align: justify; orphans: 2; widows
 p strong {{ font-weight: 700; color: #111315; }}
 p.sub-head {{ text-indent: 0; margin: 1.1em 0 0.5em 0; font-size: 14pt; color: #7c2d12; border-left: 3.5px solid #9e2a2b; padding-left: 3mm; page-break-after: avoid; }}
 p.yw {{
-    font-family: "BookKaiTi", "STKaiti", "KaiTi", "楷体", serif;
-    font-size: 14.8pt; line-height: 1.88; letter-spacing: 0.025em; text-indent: 0;
-    margin: 1.15em 0 0.9em 0; padding: 0.72em 1em; border: 1px solid #e6dec8;
+    font-family: "STKaiti", "KaiTi", "Kaiti SC", "楷体", serif;
+    font-size: 14.2pt; line-height: 1.88; letter-spacing: 0.02em; text-indent: 0;
+    margin: 1.1em 0 0.85em 0; padding: 0.7em 0.95em; border: 1px solid #e6dec8;
     border-left: 4.5px solid #9e2a2b; background-color: #f8f4ea; color: #181512;
     border-radius: 0 6px 6px 0; page-break-inside: avoid;
 }}
 .yw-badge {{
-    display: inline-block; font-family: "BookPingFang", sans-serif; font-size: 10.2pt;
-    font-weight: 700; color: #fff; background-color: #9e2a2b; padding: 1px 7.5px;
+    display: inline-block; font-family: sans-serif; font-size: 10pt;
+    font-weight: 700; color: #fff; background-color: #9e2a2b; padding: 1px 7px;
     border-radius: 4px; margin-right: 7px; vertical-align: 1.5px; line-height: 1.5;
 }}
-.fang-card {{
-    font-family: "BookKaiTi", "STKaiti", "KaiTi", "楷体", serif;
-    font-size: 13.8pt; line-height: 1.82; text-indent: 0; margin: 0.65em 0 1.05em 0;
-    padding: 0.62em 0.95em; background-color: #fcfaf5; border: 1px dashed #d5c5ab;
+.highlight-card {{
+    font-family: "STKaiti", "KaiTi", "Kaiti SC", "楷体", serif;
+    font-size: 13.5pt; line-height: 1.82; text-indent: 0; margin: 0.65em 0 1em 0;
+    padding: 0.6em 0.9em; background-color: #fcfaf5; border: 1px dashed #d5c5ab;
     border-left: 3.5px solid #b46535; border-radius: 0 5px 5px 0; color: #2c221b;
     font-weight: bold; page-break-inside: avoid;
 }}
-.fang-name {{ display: block; font-family: "BookPingFang", sans-serif; font-size: 12.2pt; font-weight: 700; color: #8c2d19; margin-bottom: 3px; }}
-.fang-jian {{ display: block; font-weight: normal; color: #433830; margin-top: 4px; font-size: 13.4pt; }}
 .img-wrap {{ text-align: center; margin: 7mm 0; page-break-inside: avoid; }}
 .img-wrap img {{ max-width: 86%; max-height: 175mm; height: auto; border-radius: 4px; border: 1px solid #e5dec9; padding: 2mm; background: #fff; }}
 </style>
@@ -441,8 +376,8 @@ p.yw {{
 <div class="cover-page">
     {cover_img_tag}
     <div class="cover-title">{title}</div>
-    <div class="cover-author">{author}</div>
-    <div class="cover-intro">{intro_html}</div>
+    {f'<div class="cover-author">{author} 著</div>' if author else ''}
+    {f'<div class="cover-intro">{intro_html}</div>' if intro_html else ''}
 </div>
 <div class="toc-page">
     <div class="toc-header"><h2>目 录</h2><div class="toc-sub">CONTENTS</div></div>
@@ -452,14 +387,15 @@ p.yw {{
 </body>
 </html>"""
 
-    safe = re.sub(r'[<>:"/\\|?*]', "_", title)
-    html_path = os.path.join(BASE, "output", "_temp_book_pdf.html")
-    pdf_path = os.path.join(BASE, "output", f"{safe}（苹方楷体精排）.pdf")
+    safe = re.sub(r'[<>:"/\\|?*]', "_", title) or book_id
+    html_path = os.path.join(BASE, "output", f"_temp_{book_id}.html")
+    pdf_path = os.path.join(BASE, "output", f"{safe}（双字体精排）.pdf")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
 
-    header_tmpl = f"""<div style="width:100%; font-size:9pt; font-family:'PingFang SC','Microsoft YaHei',sans-serif; color:#8a8175; padding:0 16.5mm; display:flex; justify-content:space-between; border-bottom:0.5px solid #e4ddd0; padding-bottom:3px;"><span>{title}</span><span>{author}</span></div>"""
-    footer_tmpl = """<div style="width:100%; font-size:9.5pt; font-family:'PingFang SC',Georgia,sans-serif; color:#787066; padding:0 16.5mm; text-align:center;">— <span class="pageNumber"></span> / <span class="totalPages"></span> —</div>"""
+    header_author = f"{author} 著" if author else ""
+    header_tmpl = f"""<div style="width:100%; font-size:9pt; font-family:sans-serif; color:#8a8175; padding:0 16.5mm; display:flex; justify-content:space-between; border-bottom:0.5px solid #e4ddd0; padding-bottom:3px;"><span>{title}</span><span>{header_author}</span></div>"""
+    footer_tmpl = """<div style="width:100%; font-size:9.5pt; font-family:sans-serif; color:#787066; padding:0 16.5mm; text-align:center;">— <span class="pageNumber"></span> / <span class="totalPages"></span> —</div>"""
 
     async with async_playwright() as p:
         browser = await launch_browser_headless(p)
@@ -482,19 +418,41 @@ p.yw {{
 
     if os.path.isfile(html_path):
         os.remove(html_path)
-    print(f"PDF 导出完成: {pdf_path} ({os.path.getsize(pdf_path) / 1048576:.2f} MB)", flush=True)
+    print(f"📕 精排 PDF 生成完成: {pdf_path} ({os.path.getsize(pdf_path) / 1048576:.2f} MB)", flush=True)
+    return pdf_path
 
 
-async def main(book_id):
+async def main(book_id_or_url):
+    book_id = extract_book_id(book_id_or_url)
+    if not book_id:
+        print("❌ 错误: 未提供有效的书籍 ID 或链接")
+        return False
+
     root, texts = read_book(book_id)
-    print(f"读取到 {len(texts)} 个章节，开始导出全格式电子书...", flush=True)
-    build_markdown_files(book_id, texts)
-    build_epub(book_id, root, texts)
-    await build_pdf(book_id, root, texts)
+    if not texts:
+        print(f"❌ 错误: 未找到该书籍已抓取的章节文件，请先运行抓取！(路径: output/{book_id}_v2/chapters/)")
+        return False
+
+    meta_path = os.path.join(root, "meta.json")
+    title = f"Book_{book_id}"
+    author, intro = "", ""
+    if os.path.isfile(meta_path):
+        with open(meta_path, encoding="utf-8") as f:
+            m = json.load(f)
+            title = m.get("title", title)
+            author = m.get("author", "")
+            intro = m.get("intro", "")
+
+    print(f"\n📦 开始导出全格式电子书: 《{title}》")
+    build_markdown_files(book_id, title, texts)
+    build_epub(book_id, root, title, author, texts)
+    await build_pdf(book_id, root, title, author, intro, texts)
+    print(f"\n🎉 恭喜！全格式电子书已生成完毕，保存在: output/ 目录\n")
+    return True
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python export_book.py <book_id>")
+        print("用法: python export_book.py <微信读书链接或ID>")
         sys.exit(1)
     asyncio.run(main(sys.argv[1]))
