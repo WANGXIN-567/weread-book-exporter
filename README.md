@@ -41,12 +41,14 @@
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 1. 安装依赖（国内极速安装）
 
 ```bash
-pip install -r requirements.txt
-playwright install chromium
+# 使用清华源极速安装依赖（几秒钟完成）
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
+
+> ⚡ **免下载大浏览器**：脚本已内置智能检测机制，会自动免下载直连系统自带的 **Microsoft Edge** 或 **Google Chrome**；如果系统未安装上述浏览器，可执行 `playwright install chromium` 补充官方内核。
 
 ### 2. 第一步：抓取全书正文与插图
 

@@ -284,6 +284,19 @@ def md_to_html_simple(md_text, img_dir):
     return "\n".join(out)
 
 
+async def launch_browser_headless(p):
+    """渲染 PDF 时自动选择可用浏览器：优先默认 Chromium，缺失时免下载直连系统 Edge / Chrome"""
+    for ch in [None, "msedge", "chrome"]:
+        try:
+            kwargs = {"headless": True}
+            if ch:
+                kwargs["channel"] = ch
+            return await p.chromium.launch(**kwargs)
+        except Exception:
+            continue
+    raise RuntimeError("未检测到可用浏览器渲染 PDF，请运行: pip install playwright && playwright install chromium")
+
+
 async def build_pdf(book_id, root, texts):
     img_dir = os.path.join(root, "images")
     meta_path = os.path.join(root, "meta.json")
@@ -449,7 +462,7 @@ p.yw {{
     footer_tmpl = """<div style="width:100%; font-size:9.5pt; font-family:'PingFang SC',Georgia,sans-serif; color:#787066; padding:0 16.5mm; text-align:center;">— <span class="pageNumber"></span> / <span class="totalPages"></span> —</div>"""
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await launch_browser_headless(p)
         page = await browser.new_page()
         file_url = "file:///" + os.path.abspath(html_path).replace("\\", "/")
         await page.goto(file_url, wait_until="networkidle", timeout=60000)

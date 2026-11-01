@@ -252,6 +252,29 @@ async def wait_stable_chars(page, timeout=6.0):
     return last_n
 
 
+async def launch_browser_context(p, user_data_dir, headless=False):
+    """自动检测可用浏览器：优先使用已安装的 Chromium，若未下载则自动免下载回退到系统自带的 Edge 或 Chrome"""
+    candidates = [
+        {"name": "Playwright Chromium", "channel": None},
+        {"name": "系统 Microsoft Edge", "channel": "msedge"},
+        {"name": "系统 Google Chrome", "channel": "chrome"},
+    ]
+    for c in candidates:
+        try:
+            kwargs = {
+                "headless": headless,
+                "viewport": {"width": 1200, "height": 900},
+                "args": ["--disable-blink-features=AutomationControlled"]
+            }
+            if c["channel"]:
+                kwargs["channel"] = c["channel"]
+            ctx = await p.chromium.launch_persistent_context(user_data_dir, **kwargs)
+            return ctx
+        except Exception:
+            continue
+    raise RuntimeError("未检测到可用浏览器，请运行: pip install playwright && playwright install chromium")
+
+
 async def main(book_id):
     book_dir = os.path.join(BASE, "output", book_id + "_v2")
     md_dir = os.path.join(book_dir, "chapters")
@@ -268,9 +291,7 @@ async def main(book_id):
     os.makedirs(USER_DATA_DIR, exist_ok=True)
 
     async with async_playwright() as p:
-        ctx = await p.chromium.launch_persistent_context(
-            USER_DATA_DIR, headless=False, viewport={"width": 1200, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"])
+        ctx = await launch_browser_context(p, USER_DATA_DIR, headless=False)
         page = await ctx.new_page()
         await page.add_init_script(HOOK)
         await page.goto("https://weread.qq.com/web/reader/%s" % book_id,
