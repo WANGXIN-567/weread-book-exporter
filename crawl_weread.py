@@ -42,6 +42,149 @@ def next_long_pause_at(step):
     return step + random.randint(*LONG_PAUSE_EVERY)
 
 
+def get_crawl_state(book_dir):
+    sf = os.path.join(book_dir, "_state.json")
+    if os.path.exists(sf):
+        try:
+            with open(sf, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"completed": False, "saved_chapter_count": 0, "last_step": 0, "total_words": 0}
+
+
+def save_crawl_state(book_dir, state):
+    sf = os.path.join(book_dir, "_state.json")
+    try:
+        with open(sf, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ 保存状态失败: {e}")
+
+
+def rebuild_chapters_from_raw(book_id):
+    """
+    从 raw/page_*.json 中恢复并重新生成所有章节 chapters/*.md 与 raw/chap_*.json
+    即使爬取过程异常终止，也可完整抢救出所有已捕获的章节内容。
+    """
+    book_dir = os.path.join(BASE, "output", book_id + "_v2")
+    raw_dir = os.path.join(book_dir, "raw")
+    md_dir = os.path.join(book_dir, "chapters")
+    os.makedirs(md_dir, exist_ok=True)
+    os.makedirs(raw_dir, exist_ok=True)
+
+    if not os.path.isdir(raw_dir):
+        return 0
+
+    page_files = sorted([f for f in os.listdir(raw_dir) if f.startswith("page_") and f.endswith(".json")])
+    if not page_files:
+        return 0
+
+    sections = []
+    cur_title = None
+    cur_blocks = []
+
+    for pf in page_files:
+        fp = os.path.join(raw_dir, pf)
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                pdata = json.load(f)
+        except Exception:
+            continue
+
+        page_ch = pdata.get("chapter") or "扉页"
+        pblocks = pdata.get("blocks")
+        if not pblocks:
+            pblocks = []
+            for ln in pdata.get("lines", []):
+                pblocks.append({"type": "line", "cls": "js", "text": ln})
+            for im in pdata.get("images", []):
+                pblocks.append({"type": "img", "src": im.get("src", "")})
+
+        if cur_title is None:
+            cur_title = page_ch
+            cur_blocks = list(pblocks)
+        elif norm(page_ch) == norm(cur_title):
+            cur_blocks.extend(pblocks)
+        else:
+            if cur_blocks:
+                sections.append((cur_title, cur_blocks))
+            cur_title = page_ch
+            cur_blocks = list(pblocks)
+
+    if cur_title and cur_blocks:
+        sections.append((cur_title, cur_blocks))
+
+    # 合并同名相邻章节
+    merged = []
+    for t, b in sections:
+        if merged and norm(merged[-1][0]) == norm(t):
+            merged[-1][1].extend(b)
+        else:
+            merged.append((t, b))
+
+    saved_idx = 0
+    total_words = 0
+    for t, blocks in merged:
+        saved_idx += 1
+        body, im_list = render_md(t, blocks, saved_idx)
+        txt_len = len(re.sub(r"<[^>]+>", "", body))
+        with open(os.path.join(md_dir, "%04d.md" % saved_idx), "w", encoding="utf-8") as f:
+            f.write(body)
+        with open(os.path.join(raw_dir, "chap_%04d.json" % saved_idx), "w", encoding="utf-8") as f:
+            json.dump({"title": t, "images": im_list, "text_len": txt_len}, f, ensure_ascii=False)
+        total_words += txt_len
+
+    save_crawl_state(book_dir, {
+        "book_id": book_id,
+        "completed": False,
+        "last_step": len(page_files),
+        "saved_chapter_count": saved_idx,
+        "last_title": cur_title or "",
+        "total_words": total_words,
+    })
+    return saved_idx
+
+
+def download_all_images(raw_dir, img_dir):
+    """统一检查并补全下载所有章节配图"""
+    os.makedirs(img_dir, exist_ok=True)
+    tasks = []
+    if os.path.isdir(raw_dir):
+        for jf in sorted(os.listdir(raw_dir)):
+            if jf.startswith("chap_") and jf.endswith(".json"):
+                try:
+                    with open(os.path.join(raw_dir, jf), encoding="utf-8") as f:
+                        for im in json.load(f).get("images", []):
+                            tasks.append((im["src"], im.get("name", "")))
+                except Exception:
+                    pass
+
+    ok_img = 0
+    for url, name in tasks:
+        if not name:
+            ext = "jpg"
+            m = re.search(r"\.(jpg|jpeg|png|gif|webp)", url.lower())
+            if m:
+                ext = m.group(1).replace("jpeg", "jpg")
+            name = f"img_{abs(hash(url)) % 1000000:06d}.{ext}"
+        fp = os.path.join(img_dir, name)
+        if os.path.exists(fp) and os.path.getsize(fp) > 500:
+            ok_img += 1
+            continue
+        try:
+            req = urllib.request.Request(url, headers={"Referer": "https://weread.qq.com/", "User-Agent": "Mozilla/5.0"})
+            raw = urllib.request.urlopen(req, timeout=20).read()
+            if len(raw) > 500:
+                with open(fp, "wb") as f:
+                    f.write(raw)
+                ok_img += 1
+        except Exception:
+            pass
+    if tasks:
+        print(f"🖼️ 章节配图就绪: {ok_img}/{len(tasks)}", flush=True)
+
+
 def extract_book_id(raw_input):
     """从纯 ID、完整网页链接或带参数的分享链接中智能提取书籍 ID"""
     if not raw_input:
@@ -327,7 +470,7 @@ async def check_cookies_login(ctx):
 
 
 async def launch_browser_context(p, user_data_dir, headless=False):
-    """自动检测可用浏览器：优先环境变量/系统自带的 Edge/Chrome，免下载 200MB 浏览器"""
+    """自动检测可用浏览器：优先系统自带 Edge/Chrome，免下载 200MB 浏览器"""
     custom_ch = os.environ.get("PLAYWRIGHT_CHANNEL")
     candidates = []
     if custom_ch:
@@ -337,6 +480,7 @@ async def launch_browser_context(p, user_data_dir, headless=False):
         {"name": "系统 Google Chrome", "channel": "chrome"},
         {"name": "Playwright Chromium", "channel": None},
     ])
+    last_err = None
     for c in candidates:
         try:
             kwargs = {
@@ -348,12 +492,16 @@ async def launch_browser_context(p, user_data_dir, headless=False):
                 kwargs["channel"] = c["channel"]
             ctx = await p.chromium.launch_persistent_context(user_data_dir, **kwargs)
             return ctx
-        except Exception:
+        except Exception as e:
+            last_err = e
+            err_msg = str(e)
+            if "ProcessSingleton" in err_msg or "Lock file" in err_msg:
+                raise RuntimeError("检测到浏览器配置目录被占用！请先关闭其他正在运行的微信读书导出窗口或浏览器后台进程后重试。")
             continue
-    raise RuntimeError("未检测到可用浏览器，请安装 Google Chrome 或 Microsoft Edge，或执行: playwright install chromium")
+    raise RuntimeError(f"未能启动浏览器 ({last_err})。请安装 Google Chrome 或 Microsoft Edge，或执行: playwright install chromium")
 
 
-async def main(book_id_or_url):
+async def main(book_id_or_url, force=False):
     book_id = extract_book_id(book_id_or_url)
     if not book_id:
         print("❌ 错误: 未能解析出有效的微信读书书籍 ID 或链接")
@@ -368,6 +516,25 @@ async def main(book_id_or_url):
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+    state = get_crawl_state(book_dir)
+    existing_mds = sorted([f for f in os.listdir(md_dir) if f.endswith(".md")])
+    raw_pages = sorted([f for f in os.listdir(raw_dir) if f.startswith("page_") and f.endswith(".json")])
+
+    # 1. 自愈检查：若存在 raw 页面落盘但 chapters 为空，自动重构
+    if not existing_mds and raw_pages:
+        print(f"🔄 检测到存在历史逐页落盘数据 ({len(raw_pages)} 页)，正在恢复章节数据...")
+        rebuild_chapters_from_raw(book_id)
+        existing_mds = sorted([f for f in os.listdir(md_dir) if f.endswith(".md")])
+        state = get_crawl_state(book_dir)
+
+    # 2. 全书已完成抓取且未指定 --force 时，直接复用已有数据
+    if state.get("completed") and existing_mds and not force:
+        print(f"📖 检测到书籍《{book_id}》此前已完整抓取（共 {len(existing_mds)} 章）。")
+        print("⏩ 自动跳过重复抓取，直接复用已有数据进入后续多格式导出流程。")
+        print("💡 如需强制重新完整抓取，可在命令行传入 --force 参数。\n")
+        download_all_images(raw_dir, img_dir)
+        return True
 
     print(f"📖 目标书籍 ID: {book_id}")
 
@@ -450,15 +617,55 @@ async def main(book_id_or_url):
             json.dump(catalog, f, ensure_ascii=False, indent=2)
         print(f"📑 目录共 {n} 项: {catalog[:3]} ... {catalog[-2:] if n > 3 else ''}", flush=True)
 
-        # 修复起始页丢失问题：直接平稳导航回第 0 项（首章/扉页），不搞多余切换
+        # 断点续传智能计算：匹配已完成的章节
+        existing_chap_files = sorted([f for f in os.listdir(raw_dir) if f.startswith("chap_") and f.endswith(".json")])
+        completed_titles = []
+        for cf in existing_chap_files:
+            try:
+                with open(os.path.join(raw_dir, cf), encoding="utf-8") as f:
+                    cdata = json.load(f)
+                    if cdata.get("title"):
+                        completed_titles.append(cdata["title"])
+            except Exception:
+                pass
+
+        resume_cat_idx = 0
+        if completed_titles and catalog:
+            last_done_norm = norm(completed_titles[-1])
+            for ci, cat in enumerate(catalog):
+                if norm(cat) == last_done_norm or last_done_norm.startswith(norm(cat)):
+                    resume_cat_idx = ci + 1
+                    break
+            if resume_cat_idx >= n:
+                print(f"🎉 目录所有 {n} 个章节此前均已全部抓取完成！")
+                save_crawl_state(book_dir, {
+                    "book_id": book_id,
+                    "completed": True,
+                    "saved_chapter_count": len(completed_titles),
+                    "total_words": state.get("total_words", 0)
+                })
+                await ctx.close()
+                download_all_images(raw_dir, img_dir)
+                return True
+
+        if resume_cat_idx > 0 and n > 0:
+            print("\n" + "="*55)
+            print(f"🔄 检测到未完成进度，执行【真·断点续传】：")
+            print(f"   - 历史已完成: {len(completed_titles)} 卷/章 (已落盘至 chapters/ 目录)")
+            print(f"   - 续跑跳转点: 目录第 {resume_cat_idx + 1}/{n} 项《{catalog[resume_cat_idx]}》")
+            print("="*55 + "\n", flush=True)
+            nav_idx = min(resume_cat_idx, n - 1)
+        else:
+            nav_idx = 0
+
+        # 平稳导航至目标章节（首章或续跑断点）
         if n > 0:
-            it0 = items.nth(0)
-            await it0.scroll_into_view_if_needed()
+            it = items.nth(nav_idx)
+            await it.scroll_into_view_if_needed()
             await asyncio.sleep(0.3)
-            await it0.click(timeout=5000)
+            await it.click(timeout=5000)
             await asyncio.sleep(1.0)
             try:
-                # 确保关闭目录面板，不遮挡阅读区
                 if await page.locator(".readerCatalog_list_item").first.is_visible():
                     await page.click("button.readerControls_item.catalog", timeout=2000)
             except Exception:
@@ -468,9 +675,9 @@ async def main(book_id_or_url):
         # 等待首屏渲染稳定后再清空/重置缓冲区，确保首页 100% 捕获
         await wait_stable_chars(page, timeout=5.0)
 
-        sections = []
-        cur_title = catalog[0] if catalog else "扉页"
-        seen_titles = {cur_title}
+        cur_title = catalog[nav_idx] if catalog and nav_idx < len(catalog) else "扉页"
+        seen_titles = set(completed_titles + [cur_title])
+        saved_idx = len(completed_titles)
         buf = []
         stale = 0
         seen_last = False
@@ -479,15 +686,16 @@ async def main(book_id_or_url):
         seen_page_sigs = set()
         seen_imgs = set()
 
-        total_words_accum = 0
+        raw_pages = sorted([f for f in os.listdir(raw_dir) if f.startswith("page_") and f.endswith(".json")])
+        start_step = len(raw_pages) if resume_cat_idx > 0 else 0
+        total_words_accum = state.get("total_words", 0) if resume_cat_idx > 0 else 0
         t_start = time.time()
-        long_pause_at = next_long_pause_at(0)
+        long_pause_at = next_long_pause_at(start_step)
 
-        print("\n🚀 开始遍历全书页面...", flush=True)
+        print(f"\n🚀 开始遍历抓取页面 (从第 {start_step} 页开始)...", flush=True)
 
-        # 循环翻页（支持超长图书）
-        for step in range(5000):
-            if step > 0:
+        for step in range(start_step, start_step + 5000):
+            if step > start_step:
                 await page.mouse.click(600, 450)
                 await page.keyboard.press("ArrowRight")
                 delay = random.uniform(*PAGE_DELAY_RANGE)
@@ -498,7 +706,7 @@ async def main(book_id_or_url):
                     await asyncio.sleep(pause)
                     long_pause_at = next_long_pause_at(step)
 
-            ok = await wait_stable_chars(page, timeout=2.2 if step > 0 else 5.0)
+            ok = await wait_stable_chars(page, timeout=2.2 if step > start_step else 5.0)
             chars = await page.evaluate("() => window.__wr_drain()") if ok else []
             imgs = await page.evaluate(IMGS_JS)
 
@@ -508,7 +716,7 @@ async def main(book_id_or_url):
 
             got_any = False
             step_words = 0
-            page_payload = []
+            page_blocks = []
 
             for side, pchars in pages:
                 lines = page_lines(pchars)
@@ -525,10 +733,8 @@ async def main(book_id_or_url):
                     txt = ln["text"].strip()
                     step_words += len(txt)
 
-                    # 🌟 核心改进：用目录反推章节切分，支持粘连剥离
                     matched_title, remainder = match_catalog_title(txt, catalog, seen_titles)
 
-                    # 若目录匹配命中，或行属性判定为 title
                     is_new_chapter = False
                     new_title = ""
                     if matched_title and norm(matched_title) != norm(cur_title):
@@ -540,49 +746,77 @@ async def main(book_id_or_url):
 
                     if is_new_chapter:
                         if buf:
-                            sections.append((cur_title, buf))
+                            # 实时落盘刚完成的章节
+                            saved_idx += 1
+                            body, im_list = render_md(cur_title, buf, saved_idx)
+                            txt_len = len(re.sub(r"<[^>]+>", "", body))
+                            with open(os.path.join(md_dir, "%04d.md" % saved_idx), "w", encoding="utf-8") as f:
+                                f.write(body)
+                            with open(os.path.join(raw_dir, "chap_%04d.json" % saved_idx), "w", encoding="utf-8") as f:
+                                json.dump({"title": cur_title, "images": im_list, "text_len": txt_len}, f, ensure_ascii=False)
+                            print(f"\n  💾 [章节实时落盘] [{saved_idx:02d}] 《{cur_title}》已保存至 chapters/{saved_idx:04d}.md ({txt_len} 字)", flush=True)
+                            save_crawl_state(book_dir, {
+                                "book_id": book_id,
+                                "completed": False,
+                                "last_step": step,
+                                "saved_chapter_count": saved_idx,
+                                "last_title": cur_title,
+                                "seen_titles": list(seen_titles),
+                                "total_words": total_words_accum,
+                            })
                         buf = []
                         cur_title = new_title
                         seen_titles.add(cur_title)
-                        print(f"\n  📑 [第 {step:03d} 页] 识别章节: 《{cur_title}》", flush=True)
+                        print(f"\n  📑 [第 {step:03d} 页] 识别新章节: 《{cur_title}》", flush=True)
                         if last_cat and norm(cur_title) == last_cat:
                             seen_last = True
 
-                        # 如果标题后还连着首段正文，将正文压入新章节
                         if remainder:
-                            buf.append({"type": "line", "cls": "js", "text": remainder})
+                            rem_blk = {"type": "line", "cls": "js", "text": remainder}
+                            buf.append(rem_blk)
+                            page_blocks.append(rem_blk)
                         continue
 
-                    # 避免同页内重复行
                     if buf and buf[-1]["type"] == "line" and buf[-1]["text"] == txt and buf[-1]["cls"] == ln["cls"]:
                         continue
 
-                    buf.append({"type": "line", "cls": ln["cls"], "text": txt})
-                    page_payload.append(txt)
+                    line_blk = {"type": "line", "cls": ln["cls"], "text": txt}
+                    buf.append(line_blk)
+                    page_blocks.append(line_blk)
 
                 side_imgs = left_imgs if side == 0 else right_imgs
                 for im in side_imgs:
                     if im["src"] not in seen_imgs:
                         seen_imgs.add(im["src"])
-                        buf.append({"type": "img", "src": im["src"]})
+                        img_blk = {"type": "img", "src": im["src"]}
+                        buf.append(img_blk)
+                        page_blocks.append(img_blk)
                         got_any = True
 
             if not pages and imgs:
                 for im in imgs:
                     if im["src"] not in seen_imgs:
                         seen_imgs.add(im["src"])
-                        buf.append({"type": "img", "src": im["src"]})
+                        img_blk = {"type": "img", "src": im["src"]}
+                        buf.append(img_blk)
+                        page_blocks.append(img_blk)
                         got_any = True
 
             total_words_accum += step_words
 
-            # 🌟 核心改进：逐页落盘保护（断点保护）
+            # 🌟 逐页完整结构化落盘（真·断点保护）
             if got_any:
                 page_file = os.path.join(raw_dir, f"page_{step:04d}.json")
                 with open(page_file, "w", encoding="utf-8") as pf:
-                    json.dump({"step": step, "chapter": cur_title, "words": step_words, "lines": page_payload}, pf, ensure_ascii=False)
+                    json.dump({
+                        "step": step,
+                        "chapter": cur_title,
+                        "words": step_words,
+                        "blocks": page_blocks,
+                        "lines": [b["text"] for b in page_blocks if b.get("type") == "line"],
+                    }, pf, ensure_ascii=False)
 
-            # 🌟 核心改进：实时可见的友好进度输出
+            # 实时可见的进度输出
             elapsed_sec = int(time.time() - t_start)
             elapsed_str = f"{elapsed_sec // 60}分{elapsed_sec % 60}秒"
             if got_any:
@@ -603,67 +837,48 @@ async def main(book_id_or_url):
                     break
 
         if cur_title and buf:
-            sections.append((cur_title, buf))
-
-        # 合并同名章节（若偶发重复）
-        merged_sections = []
-        for t, b in sections:
-            if merged_sections and norm(merged_sections[-1][0]) == norm(t):
-                merged_sections[-1][1].extend(b)
-            else:
-                merged_sections.append((t, b))
-
-        print(f"\n" + "="*50)
-        print(f"🎉 抓取成功！全书共识别出 {len(merged_sections)} 个章节:")
-        print("="*50)
-        total_words = 0
-        saved_idx = 0
-        for t, blocks in merged_sections:
             saved_idx += 1
-            body, im_list = render_md(t, blocks, saved_idx)
+            body, im_list = render_md(cur_title, buf, saved_idx)
             txt_len = len(re.sub(r"<[^>]+>", "", body))
-            if txt_len < 15 and not im_list and saved_idx > 1:
-                saved_idx -= 1
-                continue
             with open(os.path.join(md_dir, "%04d.md" % saved_idx), "w", encoding="utf-8") as f:
                 f.write(body)
             with open(os.path.join(raw_dir, "chap_%04d.json" % saved_idx), "w", encoding="utf-8") as f:
-                json.dump({"title": t, "images": im_list, "text_len": txt_len}, f, ensure_ascii=False)
-            total_words += txt_len
-            print(f"  [{saved_idx:02d}] {t[:28]:<28} {txt_len:6d} 字 | {len(im_list)} 图", flush=True)
+                json.dump({"title": cur_title, "images": im_list, "text_len": txt_len}, f, ensure_ascii=False)
+            print(f"\n  💾 [末章落盘] [{saved_idx:02d}] 《{cur_title}》已写入 chapters/{saved_idx:04d}.md ({txt_len} 字)", flush=True)
 
-        print(f"\n📊 统计: 全书合计 {total_words} 字，已保存至 chapters/ 目录", flush=True)
+        save_crawl_state(book_dir, {
+            "book_id": book_id,
+            "completed": True,
+            "last_step": step,
+            "saved_chapter_count": saved_idx,
+            "last_title": cur_title,
+            "seen_titles": list(seen_titles),
+            "total_words": total_words_accum,
+        })
+
+        print(f"\n" + "="*50)
+        print(f"🎉 抓取成功！全书已保存 {saved_idx} 个章节，累计 {total_words_accum} 字")
+        print("="*50)
         await ctx.close()
 
-    # 下载章节插图
-    tasks = []
-    for jf in sorted(os.listdir(raw_dir)):
-        if jf.startswith("chap_") and jf.endswith(".json"):
-            with open(os.path.join(raw_dir, jf), encoding="utf-8") as f:
-                for im in json.load(f).get("images", []):
-                    tasks.append((im["src"], im["name"]))
-    ok_img = 0
-    for url, name in tasks:
-        fp = os.path.join(img_dir, name)
-        if os.path.exists(fp) and os.path.getsize(fp) > 500:
-            ok_img += 1
-            continue
-        try:
-            req = urllib.request.Request(url, headers={"Referer": "https://weread.qq.com/", "User-Agent": "Mozilla/5.0"})
-            raw = urllib.request.urlopen(req, timeout=20).read()
-            if len(raw) > 500:
-                with open(fp, "wb") as f:
-                    f.write(raw)
-                ok_img += 1
-        except Exception as e:
-            print(f"  图片下载跳过 {name}: {e}")
-    if tasks:
-        print(f"🖼️ 章节配图下载完成: {ok_img}/{len(tasks)}", flush=True)
+    # 统一补齐配图下载
+    download_all_images(raw_dir, img_dir)
     return True
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("用法: python crawl_weread.py <微信读书链接或ID>")
+        print("用法: python crawl_weread.py <微信读书链接或ID> [--force] [--rebuild]")
         sys.exit(1)
-    asyncio.run(main(sys.argv[1]))
+
+    force_flag = "--force" in sys.argv or "-f" in sys.argv
+    rebuild_flag = "--rebuild" in sys.argv
+
+    bid = [a for a in sys.argv[1:] if not a.startswith("-")][0]
+    extracted = extract_book_id(bid)
+
+    if rebuild_flag:
+        cnt = rebuild_chapters_from_raw(extracted)
+        print(f"🎉 已成功从 raw/ 页面落盘数据恢复 {cnt} 个章节！")
+    else:
+        asyncio.run(main(extracted, force=force_flag))

@@ -118,6 +118,20 @@ def read_book(book_id):
     root = os.path.join(BASE, "output", book_id + "_v2")
     ch_dir = os.path.join(root, "chapters")
     head_dir = os.path.join(root, "_head")
+    raw_dir = os.path.join(root, "raw")
+
+    # 🌟 断点数据自愈重构：若 chapters 目录为空但 raw 存在逐页落盘记录，自动恢复所有章节
+    existing_mds = [fn for fn in os.listdir(ch_dir) if fn.endswith(".md")] if os.path.isdir(ch_dir) else []
+    if not existing_mds and os.path.isdir(raw_dir):
+        raw_pages = [f for f in os.listdir(raw_dir) if f.startswith("page_") and f.endswith(".json")]
+        if raw_pages:
+            print(f"🔄 检测到 chapters 章节目录为空，正在从 raw/ 逐页落盘数据 ({len(raw_pages)} 页) 自动恢复章节...")
+            try:
+                import crawl_weread
+                rebuilt_cnt = crawl_weread.rebuild_chapters_from_raw(book_id)
+                print(f"✅ 成功从历史落盘记录中重构恢复了 {rebuilt_cnt} 个完整章节！")
+            except Exception as e:
+                print(f"⚠️ 自动重构章节提示: {e}")
 
     heads = []
     if os.path.isdir(head_dir):

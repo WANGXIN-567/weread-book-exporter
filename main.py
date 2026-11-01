@@ -33,7 +33,7 @@ def print_banner():
     """)
 
 
-async def run(raw_input):
+async def run(raw_input, force=False):
     book_id = crawl_weread.extract_book_id(raw_input)
     if not book_id:
         print("❌ 错误: 请输入有效的微信读书网页链接或书籍 ID！")
@@ -42,9 +42,9 @@ async def run(raw_input):
 
     print(f"🚀 开始执行一键全流程导出，书籍 ID: {book_id}\n")
 
-    # 第一步：完整抓取全书
+    # 第一步：完整抓取全书（支持真·断点续传与自愈复用）
     print("【步骤 1/2】抓取全书章节、插图与原版封面...")
-    crawl_ok = await crawl_weread.main(book_id)
+    crawl_ok = await crawl_weread.main(book_id, force=force)
     if not crawl_ok:
         print("\n❌ 抓取未完成，导出终止。请检查网络或重新扫码。")
         sys.exit(1)
@@ -64,7 +64,10 @@ async def run(raw_input):
 
 if __name__ == "__main__":
     print_banner()
-    if len(sys.argv) < 2:
+    force_flag = any(arg in sys.argv for arg in ("--force", "-f"))
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+
+    if not args:
         try:
             user_input = input("请输入微信读书网页链接或书籍 ID: ").strip()
         except (KeyboardInterrupt, EOFError):
@@ -74,6 +77,6 @@ if __name__ == "__main__":
             print("未输入有效链接或 ID，程序退出。")
             sys.exit(0)
     else:
-        user_input = sys.argv[1].strip()
+        user_input = args[0].strip()
 
-    asyncio.run(run(user_input))
+    asyncio.run(run(user_input, force=force_flag))

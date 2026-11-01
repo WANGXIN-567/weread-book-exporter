@@ -6,8 +6,8 @@ set PYTHONIOENCODING=utf-8
 cd /d "%~dp0"
 
 set "PY_EXE="
-if exist "F:\AI\workbuddy\2026-10-30-20-57-36\weread-md\.venv\Scripts\python.exe" set "PY_EXE=F:\AI\workbuddy\2026-10-30-20-57-36\weread-md\.venv\Scripts\python.exe"
-if not defined PY_EXE if exist "%~dp0.venv\Scripts\python.exe" set "PY_EXE=%~dp0.venv\Scripts\python.exe"
+if exist "%~dp0.venv\Scripts\python.exe" set "PY_EXE=%~dp0.venv\Scripts\python.exe"
+if not defined PY_EXE if defined WEREAD_PYTHON if exist "%WEREAD_PYTHON%" set "PY_EXE=%WEREAD_PYTHON%"
 if not defined PY_EXE set "PY_EXE=python"
 
 "%PY_EXE%" -V >nul 2>nul

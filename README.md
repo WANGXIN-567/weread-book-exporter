@@ -48,8 +48,10 @@
 git clone https://github.com/WANGXIN-567/weread-book-exporter.git
 cd weread-book-exporter
 
-# 使用国内镜像极速安装依赖（几秒钟完成）
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 使用国内高速镜像安装依赖（推荐腾讯云或阿里云，稳定不报 403）
+pip install -r requirements.txt -i https://mirrors.cloud.tencent.com/pypi/simple/
+# 备用阿里云镜像：
+# pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 ```
 
 > ⚡ **免下载 200MB 浏览器**：代码内置了智能浏览器检测，会自动直接调用电脑自带的 **Microsoft Edge** 或 **Google Chrome**；如果系统未安装上述浏览器，可执行 `playwright install chromium` 补充下载。
