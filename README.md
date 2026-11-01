@@ -8,6 +8,10 @@
 
 自动保留原书的**目录结构、标题层级、引文/重点段落样式与高清插图**，提供舒适的大字号双字体排版，方便个人深度学习、全文检索与知识库归档。
 
+<p align="center">
+  <img src="assets/preview.png" alt="WeRead Book Exporter 排版预览" width="100%">
+</p>
+
 ---
 
 ## ✨ 核心特性

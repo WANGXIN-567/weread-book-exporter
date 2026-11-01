@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""WeRead Canvas Full-Book Crawler (crawl_weread.py)
+"""WeRead Full-Book Crawler (crawl_weread.py)
 
 核心特性：
-1. 自动检测并切换至【双栏水平翻页模式 (isHorizontalReader)】，彻底解决微信读书 Web 端在上下滚动模式下因虚拟滚动高度截断导致每章下半部分丢失 ~40% 内容的问题。
-2. 注入 Canvas 2D Context Hook (fillText + clearRect)，利用左/右栏坐标与帧序列号精确切分每一单页，消除短页与跨章同 Y 坐标文字交错。
-3. 自动识别画布字号与字重层级（标题 / 古籍条文引文 / 加粗方剂或小标题 / 正文），并自动下载原书全部插图与封面。
+1. 自动切换至双栏水平翻页模式，解决网页端上下滚动模式下因虚拟滚动分片导致章节下半部分漏字的问题。
+2. 捕获 Canvas 2D 绘制指令与分栏坐标，精准切分每一单页，消除跨页文字重复或交错。
+3. 自动识别画布字号与字重层级（标题 / 独立引文 / 加粗段落 / 正文），并下载原书全部高清插图。
 
 用法:
     python crawl_weread.py <book_id>
@@ -13,6 +13,7 @@ import asyncio
 import collections
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -22,7 +23,15 @@ from playwright.async_api import async_playwright
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 USER_DATA_DIR = os.path.join(BASE, "cache", "browser_profile")
-DEFAULT_BOOK_ID = "3b132980813ab94eeg013129"
+
+# 翻页节奏：宁可慢，也不要给服务器造成压力
+PAGE_DELAY_RANGE = (8.0, 20.0)       # 每次翻页后的随机等待（秒）
+LONG_PAUSE_EVERY = (10, 20)          # 每隔 10~20 页触发一次长停顿
+LONG_PAUSE_RANGE = (60.0, 120.0)     # 长停顿时长（秒）
+
+
+def next_long_pause_at(step):
+    return step + random.randint(*LONG_PAUSE_EVERY)
 
 HOOK = """
 (function() {
@@ -331,11 +340,20 @@ async def main(book_id):
         seen_page_sigs = set()
         seen_imgs = set()
 
+        long_pause_at = next_long_pause_at(0)
         for step in range(1200):
             if step > 0:
                 await page.mouse.click(600, 450)
                 await page.keyboard.press("ArrowRight")
-                await asyncio.sleep(0.35)
+                # 随机翻页延迟（8~20 秒）
+                delay = random.uniform(*PAGE_DELAY_RANGE)
+                await asyncio.sleep(delay)
+                # 每 10~20 页加入 1~2 分钟的长停顿
+                if step >= long_pause_at:
+                    pause = random.uniform(*LONG_PAUSE_RANGE)
+                    print("  ⏸ 已翻 %d 页，长停顿 %.0f 秒..." % (step, pause), flush=True)
+                    await asyncio.sleep(pause)
+                    long_pause_at = next_long_pause_at(step)
 
             ok = await wait_stable_chars(page, timeout=2.2 if step > 0 else 5.0)
             chars = await page.evaluate("() => window.__wr_drain()") if ok else []
@@ -459,5 +477,7 @@ async def main(book_id):
 
 
 if __name__ == "__main__":
-    bid = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BOOK_ID
-    asyncio.run(main(bid))
+    if len(sys.argv) < 2:
+        print("用法: python crawl_weread.py <book_id>")
+        sys.exit(1)
+    asyncio.run(main(sys.argv[1]))

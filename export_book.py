@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """WeRead Multi-Format Book Exporter (export_book.py)
 
-支持将 crawl_weread.py 抓取的章节导出为：
-1. 纯 Markdown 学习版 (.md)：条文采用 `> **条文**` 引用块，适合 Obsidian / Notion。
-2. HTML 标注版 Markdown (.md)：保留 `<p class="yw">` 与 `<p class="fang">` 标签。
-3. 双字体精排 EPUB (.epub)：条文与方剂采用楷体，解读采用宋体，内嵌全部插图。
-4. 大字号【苹方正文 + 楷体条文】精排 PDF (.pdf)：含封面、可点击目录、PDF 书签大纲、朱砂红条文徽章、独立经方卡片、插图与页码。
+支持将 crawl_weread.py 抓取的书籍章节一键导出为：
+1. 纯 Markdown 笔记版 (.md)：引文采用 `>` 引用块，适合 Obsidian / Notion。
+2. HTML 样式版 Markdown (.md)：保留段落样式标签。
+3. 双字体精排 EPUB (.epub)：内嵌多字体样式与全部插图。
+4. 大字号精排 PDF (.pdf)：苹方正文 + 楷体引文，含封面、可点击目录、PDF 书签大纲、插图与页码。
 
 用法:
     python export_book.py <book_id>
@@ -21,7 +21,6 @@ import sys
 from playwright.async_api import async_playwright
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_BOOK_ID = "3b132980813ab94eeg013129"
 
 FANG_P = re.compile(r'^<p class="fang">(.*)</p>$')
 SENT_END = re.compile(r'[。！？；：…”）》」]$')
@@ -482,5 +481,7 @@ async def main(book_id):
 
 
 if __name__ == "__main__":
-    bid = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BOOK_ID
-    asyncio.run(main(bid))
+    if len(sys.argv) < 2:
+        print("用法: python export_book.py <book_id>")
+        sys.exit(1)
+    asyncio.run(main(sys.argv[1]))
