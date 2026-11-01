@@ -14,6 +14,13 @@ import asyncio
 import os
 import sys
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import crawl_weread
 import export_book
 
@@ -58,8 +65,15 @@ async def run(raw_input):
 if __name__ == "__main__":
     print_banner()
     if len(sys.argv) < 2:
-        print("用法: python main.py <微信读书网页链接或书籍ID>")
-        print("示例: python main.py https://weread.qq.com/web/reader/3b132980813ab94eeg013129")
-        sys.exit(1)
+        try:
+            user_input = input("请输入微信读书网页链接或书籍 ID: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n已取消。")
+            sys.exit(0)
+        if not user_input:
+            print("未输入有效链接或 ID，程序退出。")
+            sys.exit(0)
+    else:
+        user_input = sys.argv[1].strip()
 
-    asyncio.run(run(sys.argv[1]))
+    asyncio.run(run(user_input))

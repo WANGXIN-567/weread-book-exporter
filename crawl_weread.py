@@ -22,6 +22,13 @@ import urllib.request
 
 from playwright.async_api import async_playwright
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 USER_DATA_DIR = os.environ.get("WEREAD_PROFILE", os.path.join(BASE, "cache", "browser_profile"))
 
