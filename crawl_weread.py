@@ -469,6 +469,38 @@ async def check_cookies_login(ctx):
         return False
 
 
+def extract_initial_book_info(response_html):
+    """从原始响应解析独立副本，避免读取页面脚本改写后的全局状态。"""
+    marker = re.search(r"window\.__INITIAL_STATE__\s*=\s*", response_html)
+    if not marker:
+        return {}
+    try:
+        state, _ = json.JSONDecoder().raw_decode(response_html[marker.end():])
+    except ValueError:
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    reader = state.get("reader")
+    if not isinstance(reader, dict):
+        return {}
+    info = reader.get("bookInfo")
+    return info if isinstance(info, dict) else {}
+
+
+async def read_book_metadata(page, response_html):
+    info = extract_initial_book_info(response_html)
+    return await page.evaluate("""(info) => {
+        const cover = document.querySelector('meta[property="og:image"]')?.content;
+        return {
+            title: info.title || document.title.replace(' - 微信读书', '').trim(),
+            author: info.author || '',
+            cover: cover || info.cover || '',
+            intro: info.intro || '',
+            publisher: info.publisher || ''
+        };
+    }""", info)
+
+
 async def launch_browser_context(p, user_data_dir, headless=False):
     """自动检测可用浏览器：优先系统自带 Edge/Chrome，免下载 200MB 浏览器"""
     custom_ch = os.environ.get("PLAYWRIGHT_CHANNEL")
@@ -545,7 +577,8 @@ async def main(book_id_or_url, force=False):
 
         target_url = f"https://weread.qq.com/web/reader/{book_id}"
         print(f"🌐 正在打开书籍阅读页: {target_url} ...", flush=True)
-        await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+        response = await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+        response_html = await response.text() if response else ""
         await asyncio.sleep(3)
 
         # 登录判定：严格使用 Cookie 凭证
@@ -570,16 +603,7 @@ async def main(book_id_or_url, force=False):
             await asyncio.sleep(3)
 
         # 抓取完整的书籍元数据与原版高清封面
-        book_meta = await page.evaluate("""() => {
-            let info = (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.reader && window.__INITIAL_STATE__.reader.bookInfo) || {};
-            return {
-                title: info.title || document.title.replace(' - 微信读书', '').trim(),
-                author: info.author || '',
-                cover: info.cover || '',
-                intro: info.intro || '',
-                publisher: info.publisher || ''
-            };
-        }""")
+        book_meta = await read_book_metadata(page, response_html)
         book_meta["book_id"] = book_id
         meta_file = os.path.join(book_dir, "meta.json")
         with open(meta_file, "w", encoding="utf-8") as f:
